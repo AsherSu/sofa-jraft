@@ -1185,21 +1185,28 @@ public class NodeImpl implements Node, RaftServerService {
         long oldTerm;
         try {
             LOG.info("Node {} start vote and grant vote self, term={}.", getNodeId(), this.currTerm);
+
+            // 检查当前节点是否在集群配置中。如果不在配置里（比如已经被移除），则不能发起选举。
             if (!this.conf.contains(this.serverId)) {
                 LOG.warn("Node {} can't do electSelf as it is not in {}.", getNodeId(), this.conf);
                 return;
             }
+
+            // 如果当前状态是 Follower (跟随者)
             if (this.state == State.STATE_FOLLOWER) {
                 LOG.debug("Node {} stop election timer, term={}.", getNodeId(), this.currTerm);
+                // 停止等待 Leader 心跳的 electionTimer “选举超时计时器”。
                 this.electionTimer.stop();
             }
+
+            // 选举前，将当前的 Leader ID 重置为空。
             resetLeaderId(PeerId.emptyPeer(), new Status(RaftError.ERAFTTIMEDOUT,
                     "A follower's leader_id is reset to NULL as it begins to request_vote."));
             this.state = State.STATE_CANDIDATE;
-            this.currTerm++;
-            this.votedId = this.serverId.copy();
+            this.currTerm++; // 增加任期
+            this.votedId = this.serverId.copy(); // 先给自己投票
             LOG.debug("Node {} start vote timer, term={} .", getNodeId(), this.currTerm);
-            this.voteTimer.start();
+            this.voteTimer.start(); // 启动投票超时计时
             this.voteCtx.init(this.conf.getConf(), this.conf.isStable() ? null : this.conf.getOldConf());
             oldTerm = this.currTerm;
         } finally {
@@ -1215,6 +1222,8 @@ public class NodeImpl implements Node, RaftServerService {
                 LOG.warn("Node {} raise term {} when getLastLogId.", getNodeId(), this.currTerm);
                 return;
             }
+
+            // 向每个 peer 发送 RequestVote RPC
             for (final PeerId peer : this.conf.listPeers()) {
                 if (peer.equals(this.serverId)) {
                     continue;
@@ -1224,22 +1233,26 @@ public class NodeImpl implements Node, RaftServerService {
                     continue;
                 }
                 final OnRequestVoteRpcDone done = new OnRequestVoteRpcDone(peer, this.currTerm, this);
-                done.request = RequestVoteRequest.newBuilder() //
-                        .setPreVote(false) // It's not a pre-vote request.
-                        .setGroupId(this.groupId) //
-                        .setServerId(this.serverId.toString()) //
-                        .setPeerId(peer.toString()) //
-                        .setTerm(this.currTerm) //
-                        .setLastLogIndex(lastLogId.getIndex()) //
-                        .setLastLogTerm(lastLogId.getTerm()) //
+                done.request = RequestVoteRequest.newBuilder()
+                        .setPreVote(false)              // 这不是预投票(PreVote)，是正式投票
+                        .setGroupId(this.groupId)       // 所属的 Raft Group ID
+                        .setServerId(this.serverId.toString()) // 候选人 ID (我自己)
+                        .setPeerId(peer.toString())     // 目标节点 ID
+                        .setTerm(this.currTerm)         // 当前任期
+                        .setLastLogIndex(lastLogId.getIndex()) // 我的最后一条日志 Index
+                        .setLastLogTerm(lastLogId.getTerm())   // 我的最后一条日志 Term
                         .build();
                 this.rpcService.requestVote(peer.getEndpoint(), done.request, done);
             }
 
+            // 持久化 term 和 votedFor（崩溃恢复后不会重复投票）
             this.metaStorage.setTermAndVotedFor(this.currTerm, this.serverId);
-            this.voteCtx.grant(this.serverId);
+            this.voteCtx.grant(this.serverId); // 在投票上下文中记录“我给自己投了一票”
+
+            // 检查是否已经赢得选举。
+            // 这种情况通常发生在单节点集群 (Single Node Cluster)，自己一票就超过了半数。
             if (this.voteCtx.isGranted()) {
-                becomeLeader();
+                becomeLeader(); // 直接成为 Leader
             }
         } finally {
             this.writeLock.unlock();
@@ -1724,8 +1737,9 @@ public class NodeImpl implements Node, RaftServerService {
     @Override
     public Message handlePreVoteRequest(final RequestVoteRequest request) {
         boolean doUnlock = true;
-        this.writeLock.lock();
+        this.writeLock.lock(); // 获取写锁，保证状态读取的一致性
         try {
+            // 1. 状态校验：如果当前节点不在 active 状态（可能正在关闭或初始化），直接拒绝
             if (!this.state.isActive()) {
                 LOG.warn("Node {} is not in active state, currTerm={}.", getNodeId(), this.currTerm);
                 return RpcFactoryHelper //
@@ -1733,6 +1747,8 @@ public class NodeImpl implements Node, RaftServerService {
                         .newResponse(RequestVoteResponse.getDefaultInstance(), RaftError.EINVAL,
                                 "Node %s is not in active state, state %s.", getNodeId(), this.state.name());
             }
+
+            // 解析发起预投票的候选人 (Candidate) 的 ID
             final PeerId candidateId = new PeerId();
             if (!candidateId.parse(request.getServerId())) {
                 LOG.warn("Node {} received PreVoteRequest from {} serverId bad format.", getNodeId(),
@@ -1742,20 +1758,31 @@ public class NodeImpl implements Node, RaftServerService {
                         .newResponse(RequestVoteResponse.getDefaultInstance(), RaftError.EINVAL,
                                 "Parse candidateId failed: %s.", request.getServerId());
             }
-            boolean granted = false;
+            boolean granted = false; // 默认不投票
+
+            // 使用 do-while(false) 结构是为了方便在任意校验失败时直接 break 跳出，避免深度嵌套或多次 return
             // noinspection ConstantConditions
             do {
+                // 2. 配置校验：如果候选人不在当前集群的成员列表中，直接拒绝
+                // 防止被移除的节点或者配置错误的节点干扰集群
                 if (!this.conf.contains(candidateId)) {
                     LOG.warn("Node {} ignore PreVoteRequest from {} as it is not in conf <{}>.", getNodeId(),
                             request.getServerId(), this.conf);
                     break;
                 }
+
+                // 3. Leader 租约校验 (极其重要！防网络分区干扰的核心机制)：
+                // 如果当前节点认为当前集群存在 Leader，并且 Leader 还是活着的（在租约有效期内，仍在正常接收心跳），
+                // 那么直接拒绝预投票！这意味着集群是健康的，发起投票的节点大概率是由于自身网络问题变成了孤岛。
                 if (this.leaderId != null && !this.leaderId.isEmpty() && isCurrentLeaderValid()) {
-                    LOG.info(
-                            "Node {} ignore PreVoteRequest from {}, term={}, currTerm={}, because the leader {}'s lease is still valid.",
+                    LOG.info("Node {} ignore PreVoteRequest from {}, term={}, currTerm={}, because the leader {}'s lease is still valid.",
                             getNodeId(), request.getServerId(), request.getTerm(), this.currTerm, this.leaderId);
                     break;
                 }
+
+                // 4. 任期 (Term) 校验：
+                // 如果候选人请求中的 Term 小于当前节点的 Term，说明它是一个过期的请求，直接拒绝。
+                // 注意：因为是预投票，这里的 request.getTerm() 实际上是候选人期望的 nextTerm。
                 if (request.getTerm() < this.currTerm) {
                     LOG.info("Node {} ignore PreVoteRequest from {}, term={}, currTerm={}.", getNodeId(),
                             request.getServerId(), request.getTerm(), this.currTerm);
@@ -1763,22 +1790,31 @@ public class NodeImpl implements Node, RaftServerService {
                     checkReplicator(candidateId);
                     break;
                 }
-                // A follower replicator may not be started when this node become leader, so we must check it.
-                // check replicator state
+
+                // 如果当前节点是 Leader，检查复制器状态（应对重新连上的落后节点）
                 checkReplicator(candidateId);
 
+                // 5. 日志完整度校验准备（释放锁）：
+                // 获取最后一条日志的 ID 可能涉及磁盘 IO 操作，为了避免长时间阻塞其他操作，先临时释放锁
                 doUnlock = false;
                 this.writeLock.unlock();
 
+                // 获取本地最新的一条日志记录（包含 Term 和 Index）
                 final LogId lastLogId = this.logManager.getLastLogId(true);
 
+                // 获取完毕，重新加锁
                 doUnlock = true;
                 this.writeLock.lock();
+
+                // 重构请求中的最新日志 ID
                 final LogId requestLastLogId = new LogId(request.getLastLogIndex(), request.getLastLogTerm());
+
+                // 6. 核心规则（Log Matching Property 校验）：
+                // 只有当候选人的日志至少和自己一样新（Term 更大，或者 Term 相等但 Index 更大/相等），才会投赞成票。
+                // 这保证了选出的新 Leader 一定包含了集群中已经被多数派提交的所有日志。
                 granted = requestLastLogId.compareTo(lastLogId) >= 0;
 
-                LOG.info(
-                        "Node {} received PreVoteRequest from {}, term={}, currTerm={}, granted={}, requestLastLogId={}, lastLogId={}.",
+                LOG.info("Node {} received PreVoteRequest from {}, term={}, currTerm={}, granted={}, requestLastLogId={}, lastLogId={}.",
                         getNodeId(), request.getServerId(), request.getTerm(), this.currTerm, granted, requestLastLogId,
                         lastLogId);
             } while (false);
@@ -2736,58 +2772,92 @@ public class NodeImpl implements Node, RaftServerService {
         long oldTerm;
         try {
             LOG.info("Node {} term {} start preVote.", getNodeId(), this.currTerm);
+
+            // 1. 状态检查：如果当前节点正在安装快照，说明数据可能严重落后，此时配置可能已过期。
+            // 因此不适合发起预投票，直接忽略并返回。
             if (this.snapshotExecutor != null && this.snapshotExecutor.isInstallingSnapshot()) {
-                LOG.warn(
-                        "Node {} term {} doesn't do preVote when installing snapshot as the configuration may be out of date.",
+                LOG.warn("Node {} term {} doesn't do preVote when installing snapshot as the configuration may be out of date.",
                         getNodeId(), this.currTerm);
                 return;
             }
+
+            // 2. 配置检查：如果当前节点甚至都不在集群当前的配置（节点列表）中，
+            // 说明它没有资格参与选举，直接返回。
             if (!this.conf.contains(this.serverId)) {
                 LOG.warn("Node {} can't do preVote as it is not in conf <{}>.", getNodeId(), this.conf);
                 return;
             }
+
+            // 记录当前的任期，为后续的 ABA 问题校验做准备
             oldTerm = this.currTerm;
         } finally {
             this.writeLock.unlock();
         }
 
+        // 3. 获取本地最新的日志 ID (包含 term 和 index)，用于在预投票请求中告诉其他节点自己数据的最新程度
         final LogId lastLogId = this.logManager.getLastLogId(true);
 
         boolean doUnlock = true;
+
+        // 耗时操作结束后，重新获取写锁，准备修改状态和发送 RPC 请求
         this.writeLock.lock();
         try {
-            // pre_vote need defense ABA after unlock&writeLock
+            // 4. 防御 ABA 问题：
+            // 在上面 unlock 和 lock 的间隙，集群状态可能发生了变化（例如收到了 Leader 的心跳，导致当前节点的 Term 被动提升了）。
+            // 如果旧的 Term 和现在的 Term 不一致，说明环境变了，当前预投票应当作废
             if (oldTerm != this.currTerm) {
                 LOG.warn("Node {} raise term {} when get lastLogId.", getNodeId(), this.currTerm);
                 return;
             }
+
+            // 5. 初始化预投票上下文
+            // 记录需要多少票才能通过。如果是单节点集群或稳定配置则传入当前配置；
+            // 若是联合共识阶段(Joint Consensus)，还需要考虑旧配置。
             this.prevVoteCtx.init(this.conf.getConf(), this.conf.isStable() ? null : this.conf.getOldConf());
+
+            // 6. 遍历集群中的所有节点，开始发送预投票请求
             for (final PeerId peer : this.conf.listPeers()) {
+                // 跳过自己（自己给自己投票的逻辑在循环外面）
                 if (peer.equals(this.serverId)) {
                     continue;
                 }
+
+                // 检查或建立与目标节点的 RPC 连接
                 if (!this.rpcService.connect(peer.getEndpoint())) {
                     LOG.warn("Node {} channel init failed, address={}.", getNodeId(), peer.getEndpoint());
                     continue;
                 }
+
+                // 构造 RPC 回调处理器，携带目标 peer 和当前的 term
                 final OnPreVoteRpcDone done = new OnPreVoteRpcDone(peer, this.currTerm);
+
+                // 构建预投票请求参数 (RequestVoteRequest)
                 done.request = RequestVoteRequest.newBuilder() //
-                        .setPreVote(true) // it's a pre-vote request.
-                        .setGroupId(this.groupId) //
-                        .setServerId(this.serverId.toString()) //
-                        .setPeerId(peer.toString()) //
-                        .setTerm(this.currTerm + 1) // next term
-                        .setLastLogIndex(lastLogId.getIndex()) //
-                        .setLastLogTerm(lastLogId.getTerm()) //
+                        .setPreVote(true) // 关键标志：标记这是 PreVote 而不是正式 Vote
+                        .setGroupId(this.groupId) // 所属的 Raft Group
+                        .setServerId(this.serverId.toString()) // 候选人（自己）的 ID
+                        .setPeerId(peer.toString()) // 目标节点的 ID
+                        .setTerm(this.currTerm + 1) // 关键逻辑：使用 next term 发起询问，但此时自己的 currTerm 并未真实增加！
+                        .setLastLogIndex(lastLogId.getIndex()) // 候选人的最新日志 Index，供其他节点判断数据新鲜度
+                        .setLastLogTerm(lastLogId.getTerm()) // 候选人的最新日志 Term
                         .build();
+
+                // 异步发送 PreVote RPC 请求
                 this.rpcService.preVote(peer.getEndpoint(), done.request, done);
             }
+
+            // 7. 默认先给自己投一票
             this.prevVoteCtx.grant(this.serverId);
+
+            // 8. 检查是否已经获得了多数派的预投票支持
+            // (通常在单节点集群，或者自身是多数派的罕见边缘情况中，这里会立刻为 true)
             if (this.prevVoteCtx.isGranted()) {
+                // 如果已经获得多数支持，准备进入正式选举阶段，将由 electSelf() 来接管或释放锁
                 doUnlock = false;
-                electSelf();
+                electSelf(); // 转变为 Candidate 并发起真正的 RequestVote
             }
         } finally {
+            // 如果没有进入 electSelf() (绝大多数情况是等待异步 RPC 结果)，则在这里释放写锁
             if (doUnlock) {
                 this.writeLock.unlock();
             }
