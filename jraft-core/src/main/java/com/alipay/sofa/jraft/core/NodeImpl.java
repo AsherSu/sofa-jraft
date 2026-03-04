@@ -1247,7 +1247,7 @@ public class NodeImpl implements Node, RaftServerService {
                 this.rpcService.requestVote(peer.getEndpoint(), done.request, done);
             }
 
-            // 持久化 term 和 votedFor（崩溃恢复后不会重复投票）
+            // 持久化 term 和 votedFor（崩溃恢复后不会重复投票，确保安全性）
             this.metaStorage.setTermAndVotedFor(this.currTerm, this.serverId);
             this.voteCtx.grant(this.serverId); // 在投票上下文中记录“我给自己投了一票”
 
@@ -1299,12 +1299,13 @@ public class NodeImpl implements Node, RaftServerService {
         Requires.requireTrue(this.state == State.STATE_CANDIDATE, "Illegal state: " + this.state);
         LOG.info("Node {} become leader of group, term={}, conf={}, oldConf={}.", getNodeId(), this.currTerm,
                 this.conf.getConf(), this.conf.getOldConf());
-        // cancel candidate vote timer
+        // stop候选者投票定时器
         stopVoteTimer();
         this.state = State.STATE_LEADER;
         this.leaderId = this.serverId.copy();
         this.replicatorGroup.resetTerm(this.currTerm);
-        // Start follower's replicators
+
+        // 为每个 Follower 创建 Replicator（负责日志复制和心跳）
         for (final PeerId peer : this.conf.listPeers()) {
             if (peer.equals(this.serverId)) {
                 continue;
@@ -1315,7 +1316,7 @@ public class NodeImpl implements Node, RaftServerService {
             }
         }
 
-        // Start learner's replicators
+        // 也为 Learner无权vote，只备份 创建 Replicator
         for (final PeerId peer : this.conf.listLearners()) {
             LOG.debug("Node {} add a learner replicator, term={}, peer={}.", getNodeId(), this.currTerm, peer);
             if (!this.replicatorGroup.addReplicator(peer, ReplicatorType.Learner)) {
@@ -1323,13 +1324,16 @@ public class NodeImpl implements Node, RaftServerService {
             }
         }
 
-        // init commit manager
+        // 重置 BallotBox负责记录日志提交给多少个节点 的 pendingIndex   ---销旧账
         this.ballotBox.resetPendingIndex(this.logManager.getLastLogIndex() + 1);
+
         // Register _conf_ctx to reject configuration changing before the first log
         // is committed.
         if (this.confCtx.isBusy()) {
             throw new IllegalStateException();
         }
+
+        // 写入当前配置日志（新 Leader 的第一条日志，也是 no-op 的替代）
         this.confCtx.flush(this.conf.getConf(), this.conf.getOldConf());
         this.stepDownTimer.start();
     }
@@ -2648,18 +2652,21 @@ public class NodeImpl implements Node, RaftServerService {
     public void handleRequestVoteResponse(final PeerId peerId, final long term, final RequestVoteResponse response) {
         this.writeLock.lock();
         try {
+            // 不是 候选人
             if (this.state != State.STATE_CANDIDATE) {
                 LOG.warn("Node {} received invalid RequestVoteResponse from {}, state not in STATE_CANDIDATE but {}.",
                         getNodeId(), peerId, this.state);
                 return;
             }
-            // check stale term
+
+            // 检查 当前的term 和 收到的选票term 是同一个
             if (term != this.currTerm) {
                 LOG.warn("Node {} received stale RequestVoteResponse from {}, term={}, currTerm={}.", getNodeId(),
                         peerId, term, this.currTerm);
                 return;
             }
-            // check response term
+
+            // 收到更高 term，立即 stepDown
             if (response.getTerm() > this.currTerm) {
                 LOG.warn("Node {} received invalid RequestVoteResponse from {}, term={}, expect={}.", getNodeId(),
                         peerId, response.getTerm(), this.currTerm);
@@ -2667,7 +2674,8 @@ public class NodeImpl implements Node, RaftServerService {
                         "Raft node receives higher term request_vote_response."));
                 return;
             }
-            // check granted quorum?
+
+            // 检查是否获得选票
             if (response.getGranted()) {
                 this.voteCtx.grant(peerId);
                 if (this.voteCtx.isGranted()) {
