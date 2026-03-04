@@ -1202,22 +1202,24 @@ public class NodeImpl implements Node, RaftServerService {
             // 选举前，将当前的 Leader ID 重置为空。
             resetLeaderId(PeerId.emptyPeer(), new Status(RaftError.ERAFTTIMEDOUT,
                     "A follower's leader_id is reset to NULL as it begins to request_vote."));
-            this.state = State.STATE_CANDIDATE;
+
+            this.state = State.STATE_CANDIDATE; // 设置候选者状态
             this.currTerm++; // 增加任期
             this.votedId = this.serverId.copy(); // 先给自己投票
             LOG.debug("Node {} start vote timer, term={} .", getNodeId(), this.currTerm);
             this.voteTimer.start(); // 启动投票超时计时
-            this.voteCtx.init(this.conf.getConf(), this.conf.isStable() ? null : this.conf.getOldConf());
+            this.voteCtx.init(this.conf.getConf(), this.conf.isStable() ? null : this.conf.getOldConf()); // 初始化上下文，包含联合一致性的情况
             oldTerm = this.currTerm;
         } finally {
             this.writeLock.unlock();
         }
 
+        // 获取当前节点最新的日志
         final LogId lastLogId = this.logManager.getLastLogId(true);
 
         this.writeLock.lock();
         try {
-            // vote need defense ABA after unlock&writeLock
+            // 防止在获取最新日志的时候，当前节点新的选举发生了
             if (oldTerm != this.currTerm) {
                 LOG.warn("Node {} raise term {} when getLastLogId.", getNodeId(), this.currTerm);
                 return;
