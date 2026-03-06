@@ -1702,6 +1702,7 @@ public class NodeImpl implements Node, RaftServerService {
         }
     }
 
+    // 处理用户客户端的请求
     @Override
     public void apply(final Task task) {
         if (this.shutdownLatch != null) {
@@ -1713,6 +1714,7 @@ public class NodeImpl implements Node, RaftServerService {
         final LogEntry entry = new LogEntry();
         entry.setData(task.getData());
 
+        // 通过 Disruptor 异步处理，避免阻塞客户端线程
         final EventTranslator<LogEntryAndClosure> translator = (event, sequence) -> {
             event.reset();
             event.done = task.getDone();
