@@ -1432,11 +1432,14 @@ public class NodeImpl implements Node, RaftServerService {
         }
     }
 
+    // 批量处理客户端写入事件
     private void executeApplyingTasks(final List<LogEntryAndClosure> tasks) {
         if (!this.logManager.hasAvailableCapacityToAppendEntries(1)) {
-            // It's overload, fail-fast
+            // 空间已满, fail-fast
+            // 提取出所有任务中非空的回调函数
             final List<Closure> dones = tasks.stream().map(ele -> ele.done).filter(Objects::nonNull)
                     .collect(Collectors.toList());
+            // 每个回调返回一个错误状态 EBUSY
             ThreadPoolsFactory.runInThread(this.groupId, () -> {
                 for (final Closure done : dones) {
                     done.run(new Status(RaftError.EBUSY, "Node %s log manager is busy.", this.getNodeId()));

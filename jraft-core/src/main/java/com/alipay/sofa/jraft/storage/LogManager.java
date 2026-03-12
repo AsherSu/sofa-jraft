@@ -118,10 +118,9 @@ public interface LogManager extends Lifecycle<LogManagerOptions>, Describer {
     void join() throws InterruptedException;
 
     /**
-     * Given specified <tt>requiredCapacity</tt> determines if that amount of space
-     * is available to append these entries. Returns true when available.
-     * @param requiredCapacity
-     * @return Returns true when available.
+     * 给定指定的 requiredCapacity，判断是否有足够的空间来追加这些条目。如果有可用空间则返回 true。
+     * @param requiredCapacity 所需容量
+     * @return 如果有可用空间则返回 true
      */
     boolean hasAvailableCapacityToAppendEntries(final int requiredCapacity);
 
